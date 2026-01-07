@@ -4,146 +4,160 @@
 #include <stdlib.h>
 #include <string.h>
 #include <json-c/json.h>
-#include <openssl/hmac.h>
 #include <unistd.h>
 #include <time.h>
+#include <stdbool.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <errno.h>
+#include <signal.h>
 
-#define MAX_WSI_COUNT   10          // max client
-
-#define DEFAULT_PORT 8000           // websocket port
-#define DEFAULT_LOG_FILE "/var/log/easy-websockd.log" // log file path
-#define DEFAULT_KEY "007208e6b9ff54e974c08635397b12f4" // HMAC Key
-#define LWS_PATH_MAX    256         // max path length
-#define LWS_BODY_MAX    1048576     // max body size (1MB)
-#define LWS_BUFFER_SIZE 16384       // buffer size (16KB)
+#include "ewsd_common.h"
+#include "ewsd_log.h"
+#include "ewsd_block.h"
+#include "ewsd_bootid.h"
+#include "ewsd_hash.h"
+#include "ewsd_event.h"
 
 int PORT = DEFAULT_PORT;
 const char *LOG_FILE = DEFAULT_LOG_FILE;
-const char *key = DEFAULT_KEY;
 
 typedef struct per_session_data {
-    struct lws *wsi; // WebSocket connection handle
-    char client_ip[LWS_PATH_MAX]; // client ip
-    char client_sid[LWS_PATH_MAX]; // client sid
-    char client_perm[LWS_PATH_MAX]; // client permission
-    int values_stored; // flag for array save (1 : save true, 0: save false)
+    struct lws *wsi;                                    // WebSocket connection handle
+    char client_ip[LWS_PATH_MAX];                       // client ip
+    char client_sid[LWS_PATH_MAX];                      // client sid
+    char client_perm[LWS_PATH_MAX];                     // client permission
+    int values_stored;                                  // flag for array save (1 : save true, 0: save false)
+    int pending_5005;
 } per_session_data_t;
 
 typedef struct session_user_data {
-    per_session_data_t *psds[MAX_WSI_COUNT]; // client management array
-    int psd_count; // curren client connected count
+    per_session_data_t *psds[MAX_WSI_COUNT];            // client management array
+    int psd_count;                                      // curren client connected count
 } session_user_data_t;
 
-pthread_mutex_t lock; // mutex
+pthread_mutex_t lock;                                   // mutex
 session_user_data_t session_user;
 
-// log write
-void log_to_file(const char *message) {
-    if (!LOG_FILE) return;
+static volatile sig_atomic_t g_broadcast_5005 = 0;
 
-    FILE *file = fopen(LOG_FILE, "a");
-    if (file) {
-        time_t now = time(NULL);
-        char timestamp[64];
-        strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S", localtime(&now));
-        fprintf(file, "[%s] %s\n", timestamp, message);
-        fclose(file);
-    } else {
-        fprintf(stderr, "Failed to open log file: %s\n", LOG_FILE);
+static void on_sigusr1(int sig) {
+    (void)sig;
+    g_broadcast_5005 = 1;
+}
+
+static void trigger_broadcast_5005(void)
+{
+    pthread_mutex_lock(&lock);
+
+    for (int i = 0; i < session_user.psd_count; ++i) {
+        if (!session_user.psds[i] || !session_user.psds[i]->wsi)
+            continue;
+
+        session_user.psds[i]->pending_5005 = 1;
+        lws_callback_on_writable(session_user.psds[i]->wsi);
     }
+
+    pthread_mutex_unlock(&lock);
 }
 
 // ubus exec
 char *execute_ubus_command(const char *path, const char *action, const char *msg) {
-    char command[1024];
-    snprintf(command, sizeof(command), "ubus call %s %s '%s'", path, action, msg);
+    static char result[LWS_BODY_MAX];
+    result[0] = '\0';
 
-    // log_to_file(command); // command
-    FILE *cmd_output = popen(command, "r");
-    if (!cmd_output) {
-        log_to_file("Failed to execute ubus command.");
+    if (!path || !action || !msg) {
+        log_to_file("execute_ubus_command: null arg");
         return NULL;
     }
 
-    static char result[LWS_BODY_MAX];
-    memset(result, 0, sizeof(result));
-    fread(result, 1, sizeof(result) - 1, cmd_output);
-    pclose(cmd_output);
-
-    // log_to_file(result); // command result
-    return result;
-}
-
-// hash verification
-int verify_hash(const char *params, const char *received_hash) {
-    if (!params || !received_hash) {
-        log_to_file("Invalid parameters for hash verification.");
-        return 0;
+    int pipefd[2];
+    if (pipe(pipefd) == -1) {
+        log_to_file("pipe failed");
+        return NULL;
     }
 
-    char *cleaned_params = strdup(params);
-    if (!cleaned_params) {
-        log_to_file("Memory allocation failed for cleaned_params.");
-        return 0;
+    pid_t pid = fork();
+    if (pid < 0) {
+        log_to_file("fork failed");
+        close(pipefd[0]); close(pipefd[1]);
+        return NULL;
     }
 
-    char *src = cleaned_params;
-    char *dst = cleaned_params;
-    while (*src) {
-        if (src[0] == '\\' && src[1] == '/') {
-            src++;
+    if (pid == 0) {
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[0]);
+        close(pipefd[1]);
+
+        execlp("ubus", "ubus", "call", path, action, msg, (char *)NULL);
+
+        const char *em = "exec ubus failed\n";
+        write(STDOUT_FILENO, em, strlen(em));
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+
+    ssize_t total = 0;
+    while (total < (ssize_t)sizeof(result) - 1) {
+        ssize_t r = read(pipefd[0], result + total, sizeof(result) - 1 - total);
+        if (r > 0) {
+            total += r;
+            continue;
         }
-        *dst++ = *src++;
+        if (r == 0) break;
+        if (errno == EINTR) continue;
+
+        log_to_file("read failed from ubus");
+        break;
     }
-    *dst = '\0';
+    result[total] = '\0';
+    close(pipefd[0]);
 
-    unsigned char recalculated_hash[EVP_MAX_MD_SIZE];
-    unsigned int hash_len;
-
-    HMAC(EVP_sha256(), key, strlen(key),
-         (unsigned char *)cleaned_params, strlen(cleaned_params),
-         recalculated_hash, &hash_len);
-
-    char recalculated_hash_hex[2 * hash_len + 1];
-    for (unsigned int i = 0; i < hash_len; i++) {
-        sprintf(&recalculated_hash_hex[i * 2], "%02x", recalculated_hash[i]);
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        log_to_file("waitpid failed");
+    } else if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        log_to_file("ubus call returned non-zero");
     }
-    recalculated_hash_hex[2 * hash_len] = '\0';
-
-    int result = strcmp(received_hash, recalculated_hash_hex) == 0;
-
-    free(cleaned_params);
 
     return result;
 }
 
-// send error to client
-void send_error_to_client(struct lws *wsi, int error_code, const char *error_message) {
-    struct json_object *response_obj = json_object_new_object();
-    struct json_object *error_obj = json_object_new_object();
+// Force remove websocket client. (just on board)
+static void remove_psd_by_wsi(struct lws *target_wsi)
+{
+    if (!target_wsi) return;
 
-    json_object_object_add(error_obj, "code", json_object_new_int(error_code));
-    json_object_object_add(error_obj, "message", json_object_new_string(error_message));
-    json_object_object_add(response_obj, "error", error_obj);
+    for (int i = 0; i < session_user.psd_count; ++i) {
+        if (session_user.psds[i] && session_user.psds[i]->wsi == target_wsi) {
 
-    json_object_object_add(response_obj, "jsonrpc", json_object_new_string("2.0"));
-    json_object_object_add(response_obj, "id", NULL); // NULL when ID is not exist
+            char log_msg[LWS_PATH_MAX + 256];
+            snprintf(log_msg, sizeof(log_msg),
+                     "<<< FORCE REMOVE >>> INDEX: %d, IP: %s, Total clients: %d",
+                     i,
+                     session_user.psds[i]->client_ip,
+                     session_user.psd_count - 1);
+            log_to_file(log_msg);
 
-    // crate json
-    const char *response_str = json_object_to_json_string(response_obj);
+            char ubus_query[1024];
+            snprintf(ubus_query, sizeof(ubus_query),
+                     "{\"ubus_rpc_session\":\"%s\"}", session_user.psds[i]->client_sid);
+            execute_ubus_command("session", "destroy", ubus_query);
 
-    // ready for websocket buffer
-    unsigned char buffer[LWS_PRE + LWS_BUFFER_SIZE];
-    size_t response_len = strlen(response_str);
-    memcpy(&buffer[LWS_PRE], response_str, response_len);
+            free(session_user.psds[i]);
+            session_user.psds[i] = NULL;
 
-    // send websocket
-    int ret = lws_write(wsi, &buffer[LWS_PRE], response_len, LWS_WRITE_TEXT);
-    if (ret < 0) {
-        log_to_file("Failed to send error message to WebSocket client.");
+            for (int j = i; j < session_user.psd_count - 1; ++j) {
+                session_user.psds[j] = session_user.psds[j + 1];
+            }
+            session_user.psds[session_user.psd_count - 1] = NULL;
+            session_user.psd_count--;
+
+            break;
+        }
     }
-
-    json_object_put(response_obj);
 }
 
 // websocket callback
@@ -176,6 +190,7 @@ static int websocket_callback(struct lws *wsi, enum lws_callback_reasons reason,
 
             session_user.psds[session_user.psd_count++] = psd;
             session_user.psds[session_user.psd_count-1]->values_stored = 0;
+            session_user.psds[session_user.psd_count-1]->pending_5005 = 0;
 
             char log_msg[LWS_PATH_MAX + 64];
             snprintf(log_msg, sizeof(log_msg), "< LWS_ESTABLISHED > INDEX : %d, IP: %s, Total clients: %d", session_user.psd_count-1, client_ip, session_user.psd_count);
@@ -186,22 +201,41 @@ static int websocket_callback(struct lws *wsi, enum lws_callback_reasons reason,
         }
 
         case LWS_CALLBACK_RECEIVE: {
-            // char log_msg[512];
-            // snprintf(log_msg, sizeof(log_msg), "Received message: %.*s", (int)len, (char *)in);
-            // log_to_file(log_msg);
+            static char message_buffer[LWS_BODY_MAX];
+            static size_t message_len = 0;
+            per_session_data_t *cur_psd = NULL;
 
-            struct json_object *request = json_tokener_parse((char *)in);
-            if (!request) {
-                log_to_file("Invalid JSON format.");
+            if (message_len + len < sizeof(message_buffer)) {
+                memcpy(message_buffer + message_len, in, len);
+                message_len += len;
+            } else {
+                log_to_file("Message buffer overflow, discarding data.");
+                message_len = 0;
                 break;
             }
 
-            struct json_object *method_obj, *params_obj, *hash_obj, *sid_obj;
+            if (!lws_is_final_fragment(wsi)) {
+                log_to_file("Message fragment received, waiting for the final fragment.");
+                break;
+            }
+
+            message_buffer[message_len] = '\0';
+
+            struct json_object *request = json_tokener_parse(message_buffer);
+            if (!request) {
+                log_to_file("Invalid JSON format.");
+                message_len = 0;
+                break;
+            }
+
+            struct json_object *method_obj=NULL, *params_obj=NULL, *hash_obj=NULL, *sid_obj=NULL, *bootid_obj=NULL;
             if (json_object_object_get_ex(request, "method", &method_obj) &&
                 json_object_object_get_ex(request, "params", &params_obj) &&
-                json_object_object_get_ex(request, "hash", &hash_obj)&&
+                json_object_object_get_ex(request, "hash", &hash_obj) &&
                 json_object_object_get_ex(params_obj, "sid", &sid_obj)) {
 
+                json_object_object_get_ex(params_obj, "bootid", &bootid_obj);
+                const char *bootid = bootid_obj ? json_object_get_string(bootid_obj) : NULL;
                 const char *method = json_object_get_string(method_obj);
                 const char *received_hash = json_object_get_string(hash_obj);
                 const char *params_string = json_object_to_json_string_ext(params_obj, JSON_C_TO_STRING_PLAIN);
@@ -213,10 +247,12 @@ static int websocket_callback(struct lws *wsi, enum lws_callback_reasons reason,
                         const char *sid = json_object_get_string(sid_obj);
                         if (!sid) { // return when sid is NULL
                             send_error_to_client(session_user.psds[i]->wsi, 5000, "session not found.");
+                            json_object_put(request);
+                            message_len = 0;
                             return -1;
                         }
 
-                        char ubus_query[512];
+                        char ubus_query[1024];
                         snprintf(ubus_query, sizeof(ubus_query), "{\"ubus_rpc_session\":\"%s\"}", sid);
 
                         char *result_sid = execute_ubus_command("session", "get", ubus_query);
@@ -243,9 +279,9 @@ static int websocket_callback(struct lws *wsi, enum lws_callback_reasons reason,
                         if (strcmp(username_buf, "unknown") == 0) { // client session of username not exist (ubus call session get)
                             send_error_to_client(session_user.psds[i]->wsi, 5001, "username unknown.");
                             lws_set_timeout(session_user.psds[i]->wsi, PENDING_TIMEOUT_CLOSE_SEND, 1);
-                            // return 0;
                         }
                         else if (session_user.psds[i]->values_stored) { // already exist client value
+                            cur_psd = session_user.psds[i];
                             process_complete = 1;
                             continue;
                         }
@@ -266,18 +302,28 @@ static int websocket_callback(struct lws *wsi, enum lws_callback_reasons reason,
                                     session_user.psds[i]->client_perm);
                             log_to_file(log_msg_info_connect);
 
+                            per_session_data_t *new_psd = session_user.psds[i];
+
                             for (int j = 0; j < session_user.psd_count; j++) {
                                 if (i != j &&
-                                    session_user.psds[j]->wsi != wsi && 
-                                    strcmp(session_user.psds[j]->client_ip, session_user.psds[i]->client_ip) != 0 &&
-                                    strcmp(session_user.psds[j]->client_perm, session_user.psds[i]->client_perm) == 0) {
-                                        log_to_file("Other IP Client init.");
-                                        send_error_to_client(session_user.psds[j]->wsi, 5002, "other ip init. logout");
-                                        send_error_to_client(session_user.psds[i]->wsi, 5003, "other ip init. login");
+                                    session_user.psds[j]->wsi != wsi &&
+                                    strcmp(session_user.psds[j]->client_ip, new_psd->client_ip) != 0 &&
+                                    strcmp(session_user.psds[j]->client_perm, new_psd->client_perm) == 0) {
+
+                                    log_to_file("Other IP Client init.");
+
+                                    struct lws *kick_wsi = session_user.psds[j]->wsi;
+                                    send_error_to_client(kick_wsi, 5002, "other ip init. logout");
+                                    remove_psd_by_wsi(kick_wsi);
+
+                                    send_error_to_client(new_psd->wsi, 5003, "other ip init. login");
+
+                                    break;
                                 }
                             }
 
-                            session_user.psds[i]->values_stored = 1;
+                            new_psd->values_stored = 1;
+                            cur_psd = new_psd;
                             process_complete = 1;
                         }
                     }
@@ -287,6 +333,14 @@ static int websocket_callback(struct lws *wsi, enum lws_callback_reasons reason,
                     if (!verify_hash(params_string, received_hash)) {
                         log_to_file("Hash mismatch. Dropping message.");
                         json_object_put(request);
+                        message_len = 0;
+                        break;
+                    }
+
+                    if (!ewsd_bootid_check(bootid)) {
+                        send_error_to_client(wsi, 5004, "boot_id mismatch.");
+                        json_object_put(request);
+                        message_len = 0;
                         break;
                     }
 
@@ -296,10 +350,13 @@ static int websocket_callback(struct lws *wsi, enum lws_callback_reasons reason,
                             json_object_object_get_ex(params_obj, "action", &action_obj)) {
                             const char *path = json_object_get_string(path_obj);
                             const char *action = json_object_get_string(action_obj);
-                            const char *msg = json_object_object_get_ex(params_obj, "msg", &msg_obj)
-                                                ? json_object_to_json_string(msg_obj)
-                                                : "{}";
-
+                            const char *msg = "{}";
+                            if (json_object_object_get_ex(params_obj, "msg", &msg_obj)) {
+                                if (cur_psd && strlen(cur_psd->client_ip) > 0 && strcmp(cur_psd->client_ip, "unknown") != 0) {
+                                    json_object_object_add(msg_obj, "ws_ip", json_object_new_string(cur_psd->client_ip));
+                                }
+                                msg = json_object_to_json_string(msg_obj);
+                            }
                             char *result = execute_ubus_command(path, action, msg);
                             if (!result) {
                                 log_to_file("Failed to execute ubus command or no response.");
@@ -322,12 +379,28 @@ static int websocket_callback(struct lws *wsi, enum lws_callback_reasons reason,
 
                             const char *response_str = json_object_to_json_string(response);
 
-                            unsigned char buffer[LWS_PRE + LWS_BUFFER_SIZE];
-                            size_t response_len = strlen(response_str);
+                            const size_t response_len = strlen(response_str);
+                            const unsigned char *data = (const unsigned char *)response_str;
+                            size_t sent = 0;
 
-                            memcpy(&buffer[LWS_PRE], response_str, response_len);
-                            if (lws_write(wsi, &buffer[LWS_PRE], response_len, LWS_WRITE_TEXT) < 0) {
-                                log_to_file("Failed to send response.");
+                            while (sent < response_len) {
+                                size_t chunk_size = (response_len - sent > LWS_BUFFER_SIZE) ? LWS_BUFFER_SIZE : (response_len - sent);
+                                unsigned char buffer[LWS_PRE + LWS_BUFFER_SIZE];
+                                memcpy(&buffer[LWS_PRE], data + sent, chunk_size);
+
+                                int flags = (sent == 0) ? LWS_WRITE_TEXT : LWS_WRITE_CONTINUATION;
+                                if (sent + chunk_size == response_len) {
+                                    flags |= LWS_WRITE_NO_FIN == 0; // last fragment
+                                } else {
+                                    flags |= LWS_WRITE_NO_FIN;
+                                }
+
+                                if (lws_write(wsi, &buffer[LWS_PRE], chunk_size, flags) < 0) {
+                                    log_to_file("Failed to send chunked response.");
+                                    break;
+                                }
+
+                                sent += chunk_size;
                             }
 
                             json_object_put(response);
@@ -339,6 +412,27 @@ static int websocket_callback(struct lws *wsi, enum lws_callback_reasons reason,
             }
 
             json_object_put(request);
+            message_len = 0;
+            break;
+        }
+
+        case LWS_CALLBACK_SERVER_WRITEABLE: {
+            pthread_mutex_lock(&lock);
+
+            for (int i = 0; i < session_user.psd_count; ++i) {
+                if (session_user.psds[i] && session_user.psds[i]->wsi == wsi) {
+                    if (session_user.psds[i]->pending_5005) {
+                        session_user.psds[i]->pending_5005 = 0;
+                        pthread_mutex_unlock(&lock);
+
+                        send_error_to_client(wsi, 5005, "reboot-button pressed.");
+                        return 0;
+                    }
+                    break;
+                }
+            }
+
+            pthread_mutex_unlock(&lock);
             break;
         }
 
@@ -351,7 +445,7 @@ static int websocket_callback(struct lws *wsi, enum lws_callback_reasons reason,
                     snprintf(log_msg, sizeof(log_msg), "<<< LWS_CALLBACK_CLOSED >>> INDEX: %d, IP: %s, Total clients: %d", i, session_user.psds[i]->client_ip, session_user.psd_count - 1);
                     log_to_file(log_msg);
 
-                    char ubus_query[512];
+                    char ubus_query[1024];
                     snprintf(ubus_query, sizeof(ubus_query), "{\"ubus_rpc_session\":\"%s\"}", session_user.psds[i]->client_sid);
                     execute_ubus_command("session", "destroy", ubus_query);
 
@@ -411,6 +505,8 @@ int main(int argc, char **argv) {
     info.max_http_header_pool = MAX_WSI_COUNT;
     info.timeout_secs = 0;
 
+    signal(SIGUSR1, on_sigusr1);
+
     struct lws_context *context = lws_create_context(&info);
     if (!context) {
         log_to_file("Failed to create lws context.");
@@ -421,11 +517,19 @@ int main(int argc, char **argv) {
     snprintf(log_msg, sizeof(log_msg), "WebSocket server started on ws://localhost:%d", PORT);
     log_to_file(log_msg);
 
+    load_system_bootid_once();
+
     while (1) {
         lws_service(context, 1000);
+
+        if (g_broadcast_5005) {
+            g_broadcast_5005 = 0;
+            trigger_broadcast_5005();
+        }
     }
 
     lws_context_destroy(context);
     pthread_mutex_destroy(&lock);
     return 0;
 }
+

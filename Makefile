@@ -5,7 +5,7 @@ PKG_RELEASE:=1
 
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)
 
-PKG_MAINTAINER:=Jiwan Kim <wldhks1004@naver.com>
+PKG_MAINTAINER:=Jiwan Kim <jiwan.kim@kaonbroadband.com>
 
 include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/kernel.mk
@@ -19,6 +19,9 @@ endef
 define Package/easy-websockd/description
   Provides a WebSocket server with JSON-RPC functionality using libwebsockets, JSON-C, and OpenSSL for encryption.
 endef
+
+EWSD_ENABLE_BOOTID := 0
+EWSD_ENABLE_HASH := 0
 
 TARGET_CFLAGS += \
 	-Werror \
@@ -36,7 +39,13 @@ define Build/Prepare
 endef
 
 define Build/Compile
-	$(TARGET_CC) $(TARGET_CFLAGS) -o $(PKG_BUILD_DIR)/easy-websockd $(PKG_BUILD_DIR)/websocket-server.c \
+	$(TARGET_CC) \
+		$(TARGET_CFLAGS) \
+		-DEWSD_ENABLE_BOOTID=$(EWSD_ENABLE_BOOTID) \
+		-DEWSD_ENABLE_HASH=$(EWSD_ENABLE_HASH) \
+		-I$(PKG_BUILD_DIR) \
+		-o $(PKG_BUILD_DIR)/easy-websockd \
+		$(PKG_BUILD_DIR)/*.c \
 		-lwebsockets -ljson-c -lcrypto -lssl
 endef
 
