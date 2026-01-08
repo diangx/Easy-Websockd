@@ -29,6 +29,8 @@ typedef struct per_session_data {
     char client_perm[LWS_PATH_MAX];                     // client permission
     int values_stored;                                  // flag for array save (1 : save true, 0: save false)
     int pending_5005;
+    int pending_ping;
+    time_t last_pong;
 } per_session_data_t;
 
 typedef struct session_user_data {
@@ -191,12 +193,15 @@ static int websocket_callback(struct lws *wsi, enum lws_callback_reasons reason,
             session_user.psds[session_user.psd_count++] = psd;
             session_user.psds[session_user.psd_count-1]->values_stored = 0;
             session_user.psds[session_user.psd_count-1]->pending_5005 = 0;
+            session_user.psds[session_user.psd_count-1]->pending_ping = 0;
+            session_user.psds[session_user.psd_count-1]->last_pong = time(NULL);
 
             char log_msg[LWS_PATH_MAX + 64];
             snprintf(log_msg, sizeof(log_msg), "< LWS_ESTABLISHED > INDEX : %d, IP: %s, Total clients: %d", session_user.psd_count-1, client_ip, session_user.psd_count);
             log_to_file(log_msg);
 
             pthread_mutex_unlock(&lock);
+            lws_set_timer_usecs(wsi, LWS_PING_INTERVAL_SEC * LWS_USEC_PER_SEC);
             break;
         }
 
@@ -428,6 +433,58 @@ static int websocket_callback(struct lws *wsi, enum lws_callback_reasons reason,
                         send_error_to_client(wsi, 5005, "reboot-button pressed.");
                         return 0;
                     }
+                    if (session_user.psds[i]->pending_ping) {
+                        session_user.psds[i]->pending_ping = 0;
+                        pthread_mutex_unlock(&lock);
+
+                        unsigned char ping_buf[LWS_PRE + 1];
+                        if (lws_write(wsi, &ping_buf[LWS_PRE], 0, LWS_WRITE_PING) < 0) {
+                            log_to_file("Failed to send ping.");
+                        }
+                        return 0;
+                    }
+                    break;
+                }
+            }
+
+            pthread_mutex_unlock(&lock);
+            break;
+        }
+
+        case LWS_CALLBACK_TIMER: {
+            pthread_mutex_lock(&lock);
+
+            for (int i = 0; i < session_user.psd_count; ++i) {
+                if (session_user.psds[i] && session_user.psds[i]->wsi == wsi) {
+                    time_t now = time(NULL);
+                    if ((now - session_user.psds[i]->last_pong) > LWS_PONG_TIMEOUT_SEC) {
+                        char log_msg[LWS_PATH_MAX + 128];
+                        snprintf(log_msg, sizeof(log_msg),
+                                 "Ping timeout. Closing connection. IP: %s",
+                                 session_user.psds[i]->client_ip);
+                        log_to_file(log_msg);
+                        pthread_mutex_unlock(&lock);
+                        lws_set_timeout(wsi, PENDING_TIMEOUT_CLOSE_SEND, 1);
+                        return 0;
+                    }
+
+                    session_user.psds[i]->pending_ping = 1;
+                    lws_callback_on_writable(wsi);
+                    break;
+                }
+            }
+
+            pthread_mutex_unlock(&lock);
+            lws_set_timer_usecs(wsi, LWS_PING_INTERVAL_SEC * LWS_USEC_PER_SEC);
+            break;
+        }
+
+        case LWS_CALLBACK_RECEIVE_PONG: {
+            pthread_mutex_lock(&lock);
+
+            for (int i = 0; i < session_user.psd_count; ++i) {
+                if (session_user.psds[i] && session_user.psds[i]->wsi == wsi) {
+                    session_user.psds[i]->last_pong = time(NULL);
                     break;
                 }
             }
@@ -532,4 +589,3 @@ int main(int argc, char **argv) {
     pthread_mutex_destroy(&lock);
     return 0;
 }
-

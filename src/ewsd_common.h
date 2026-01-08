@@ -7,5 +7,7 @@
 #define LWS_PATH_MAX    512                             // max path length
 #define LWS_BODY_MAX    2097152                         // max body size (2MB)
 #define LWS_BUFFER_SIZE 32768                           // buffer size (32KB)
+#define LWS_PING_INTERVAL_SEC 30                        // ping interval
+#define LWS_PONG_TIMEOUT_SEC 90                         // pong timeout
 
 #endif
